@@ -5,7 +5,7 @@ project_name='MEDS'
 exp_name='dapo'
 
 adv_estimator=MEDS
-cluster_method="hdbscan_knn"
+cluster_method="hdbscan"
 
 use_kl_in_reward=False
 kl_coef=0.0
@@ -43,11 +43,11 @@ RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 NNODES=${NNODES:-1}
 
 # Paths
-RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/Reward_RL"}
-MODEL_PATH=${MODEL_PATH:-"/inspire/hdd/project/exploration-topic/public/bwang/models/Qwen2.5-Math-7B"}
-CKPTS_DIR=${CKPTS_DIR:-"/inspire/qb-ilm/project/exploration-topic/public/exwang/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"/inspire/hdd/project/exploration-topic/public/bwang/data/unified_math_25k_new.parquet"}
-TEST_FILE=${TEST_FILE:-"/inspire/hdd/project/exploration-topic/public/bwang/data/AIME_2024/aime-2024_new.parquet"}
+RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/MEDS"}
+MODEL_PATH=${MODEL_PATH:-"${HOME}/models/Qwen2.5-Math-7B"}
+CKPTS_DIR=${CKPTS_DIR:-"${HOME}/ckpts/${project_name}/${exp_name}"}
+TRAIN_FILE=${TRAIN_FILE:-"${HOME}/data/unified_math.parquet"}
+TEST_FILE=${TEST_FILE:-"${HOME}/data/aime-2024.parquet"}
 
 
 # Algorithm
@@ -63,7 +63,7 @@ offload=False
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
-    -- python3 -m recipe.dapo.main_dapo \
+    -- python3 -m recipe.dapo.main_meds \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \
