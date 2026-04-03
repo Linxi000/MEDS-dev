@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-#!/usr/bin/env bash
 set -xeuo pipefail
 
-project_name='DAPO'
-exp_name='DAPO-Qwen2.5-7B-Math-baseline-1024'
+project_name='MEDS'
+exp_name='dapo'
 
-adv_estimator=grpo
+adv_estimator=MEDS
+cluster_method="hdbscan"
 
 use_kl_in_reward=False
 kl_coef=0.0
@@ -31,17 +31,24 @@ gen_prompt_bsz=512
 train_prompt_mini_bsz=16
 n_resp_per_prompt=16
 
+penalty_coef=0.1
+use_layer_diff=False
+use_last_n_layers=14
+cluster_penalty_target="none" # "wrong", "right", "both", "none"
+
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 NNODES=${NNODES:-1}
+
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/MEDS"}
 MODEL_PATH=${MODEL_PATH:-"${HOME}/models/Qwen2.5-Math-7B"}
 CKPTS_DIR=${CKPTS_DIR:-"${HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${HOME}/data/unified_math.parquet"}
 TEST_FILE=${TEST_FILE:-"${HOME}/data/aime-2024.parquet"}
+
 
 # Algorithm
 temperature=1.0
@@ -56,7 +63,7 @@ offload=False
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
-    -- python3 -m recipe.dapo.main_dapo \
+    -- python3 -m recipe.MEDS.main_meds \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \
@@ -126,7 +133,12 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=True \
     trainer.test_freq=2 \
-    trainer.save_freq=200 \
+    trainer.save_freq=50 \
     trainer.total_epochs=100 \
     trainer.default_local_dir="${CKPTS_DIR}" \
-    trainer.resume_mode=disable
+    trainer.resume_mode=disable \
+    +trainer.cluster_method=${cluster_method} \
+    +trainer.clustering.use_layer_diff=${use_layer_diff} \
+    +trainer.clustering.use_last_n_layers=${use_last_n_layers} \
+    +trainer.clustering.cluster_penalty_target=${cluster_penalty_target} \
+    +algorithm.penalty_coef=${penalty_coef}
