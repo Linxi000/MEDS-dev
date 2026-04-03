@@ -28,12 +28,7 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss
-from verl.trainer.ppo.metric_utils import (
-    compute_data_metrics,
-    compute_throughout_metrics,
-    compute_timing_metrics,
-    reduce_metrics,
-)
+from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics
 from verl.trainer.ppo.ray_trainer import (
     AdvantageEstimator,
     RayPPOTrainer,
@@ -41,11 +36,9 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     compute_response_mask,
 )
-from verl.trainer.ppo.reward import compute_reward
-from recipe.MEDS.layer_logits_utils import (
-    analyze_and_log_step,
-    prepare_layer_logits_analysis
-)
+from verl.trainer.ppo.reward import extract_reward
+from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
+from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
 from verl.utils.rollout_skip import RolloutSkip
 
@@ -54,6 +47,37 @@ class RayDAPOTrainer(RayPPOTrainer):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
+
+    def compute_kl_related_metrics(self, batch: DataProto, metrics: dict, timing_raw: dict):
+        batch.batch["response_mask"] = compute_response_mask(batch)
+
+        # recompute old_log_probs
+        with marked_timer("old_log_prob", timing_raw, "blue"):
+            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+            entropys = old_log_prob.batch["entropys"]
+            response_masks = batch.batch["response_mask"]
+            actor_config = self.config.actor_rollout_ref.actor
+            entropy_agg = agg_loss(
+                loss_mat=entropys,
+                loss_mask=response_masks,
+                loss_agg_mode=actor_config.loss_agg_mode,
+                loss_scale_factor=actor_config.loss_scale_factor,
+            )
+            old_log_prob_metrics = {
+                "actor/entropy": entropy_agg.detach().item(),
+                "perf/mfu/actor_infer": old_log_prob_mfu,
+            }
+            metrics.update(old_log_prob_metrics)
+            old_log_prob.batch.pop("entropys")
+            batch = batch.union(old_log_prob)
+
+        if self.use_reference_policy:
+            # compute reference log_prob
+            with marked_timer("ref", timing_raw, "olive"):
+                ref_log_prob = self._compute_ref_log_prob(batch)
+                batch = batch.union(ref_log_prob)
+
+        return batch
 
     def fit(self):
         """
@@ -75,18 +99,15 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         self.global_steps = 0
         self.gen_steps = 0
-
-        # KNN 状态：按 prompt index 维护，跨 epoch 累积
-        if not hasattr(self, "knn_state"):
-            self.knn_state: dict[int, dict] = {}
-            self.knn_prompt_examples: dict[int, str] = {}
+        self.max_steps_duration = 0
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        self.checkpoint_manager.update_weights()
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        if self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
@@ -95,7 +116,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
-            rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
+            rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
             rollout_skip.wrap_generate_sequences()
 
         # add tqdm
@@ -118,8 +139,12 @@ class RayDAPOTrainer(RayPPOTrainer):
         batch = None
         num_prompt_in_batch = 0
         num_gen_batches = 0
-        for epoch in range(self.config.trainer.total_epochs):
+        current_epoch = self.global_steps // len(self.train_dataloader)
+
+        for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
+                if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
+                    self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
 
                 with marked_timer("start_profile", timing_raw):
@@ -130,18 +155,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                     )
 
                 new_batch: DataProto = DataProto.from_single_dict(batch_dict)
+                new_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
                 num_gen_batches += 1
-                # pop those keys for generation
-                if "multi_modal_data" in new_batch.non_tensor_batch.keys():
-                    gen_batch = new_batch.pop(
-                        batch_keys=["input_ids", "attention_mask", "position_ids"],
-                        non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
-                    )
-                else:
-                    gen_batch = new_batch.pop(
-                        batch_keys=["input_ids", "attention_mask", "position_ids"],
-                        non_tensor_batch_keys=["raw_prompt_ids"],
-                    )
+                gen_batch = self._get_gen_batch(new_batch)
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
@@ -151,7 +167,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
@@ -159,15 +175,15 @@ class RayDAPOTrainer(RayPPOTrainer):
                         with marked_timer("gen_max", timing_raw, "red"):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                            gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
 
                             new_batch = new_batch.union(gen_baseline_output)
                             # compute reward model score on new_batch
                             rm_scores = None
                             if self.use_rm and "rm_scores" not in new_batch.batch.keys():
-                                rm_scores = self.rm_wg.compute_rm_score(new_batch)
+                                rm_scores = self._compute_reward_colocate(new_batch)
                                 new_batch = new_batch.union(rm_scores)
-                            reward_baseline_tensor, _ = compute_reward(new_batch, self.reward_fn)
+                            reward_baseline_tensor, _ = extract_reward(new_batch)
                             reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
                             keys_to_pop = set(gen_baseline_output.batch.keys())
@@ -186,17 +202,22 @@ class RayDAPOTrainer(RayPPOTrainer):
                     new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     new_batch = new_batch.union(gen_batch_output)
 
+                    if self.config.algorithm.use_kl_in_reward:
+                        # We need these metrics for apply_kl_penalty if using kl in reward
+                        new_batch = self.compute_kl_related_metrics(new_batch, metrics, timing_raw)
+                        # otherwise, we will compute those after dynamic sampling
+
                     with marked_timer("reward", timing_raw, "yellow"):
                         # compute scores. Support both model and function-based.
                         # We first compute the scores using reward model. Then, we call reward_fn to combine
                         # the results from reward model and rule-based results.
                         if self.use_rm and "rm_scores" not in new_batch.batch.keys():
                             # we first compute reward model score
-                            reward_tensor = self.rm_wg.compute_rm_score(new_batch)
-                            new_batch = new_batch.union(reward_tensor)
+                            batch_reward = self._compute_reward_colocate(new_batch)
+                            new_batch = new_batch.union(batch_reward)
 
                         # we combine with rule-based rm
-                        reward_tensor, reward_extra_infos_dict = compute_reward(new_batch, self.reward_fn)
+                        reward_tensor, reward_extra_infos_dict = extract_reward(new_batch)
 
                         new_batch.batch["token_level_scores"] = reward_tensor
 
@@ -277,10 +298,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                             traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
                             batch = batch[:traj_bsz]
 
-                    # === Updating & 额外分析 ===
+                    self.checkpoint_manager.sleep_replicas()
 
-                    batch.batch["response_mask"] = compute_response_mask(batch)
-
+                    # === Updating ===
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -291,53 +311,24 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                    
-                    # 在 compute_log_prob 之前，准备 brace_pos_absolute 和 acc，以便在 compute_log_prob 里复用 forward 抽 layer_logits
-                    prepare_layer_logits_analysis(self.tokenizer, batch)
 
-                    # recompute old_log_probs（这里会复用 forward 来抽 layer_logits）
-                    with marked_timer("old_log_prob", timing_raw, "blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        
-                        # 在 reward 之后、更新前，抽取错误且含 \\boxed{ 的样本 layer_logits，并落盘 step 信息
-                        # analyze_and_log_step 会从 old_log_prob 中自动提取 layer_logits
-                        analyze_and_log_step(
-                            tokenizer=self.tokenizer,
-                            config=self.config,
-                            global_steps=self.global_steps,
-                            batch=batch,
-                            epoch_idx=epoch,
-                            knn_state=self.knn_state,
-                            knn_prompt_examples=self.knn_prompt_examples,
-                            old_log_prob=old_log_prob,
-                        )
-                        # 无论 analyze_and_log_step 成功还是失败，都需要合并 old_log_prob 到 batch
-                        # 这样才能确保 batch 包含 temperature 等必要的 meta_info
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
-
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with marked_timer("ref", timing_raw, "olive"):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                    if not self.config.algorithm.use_kl_in_reward:
+                        batch = self.compute_kl_related_metrics(batch, metrics, timing_raw)
 
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, "cyan"):
-                            values = self.critic_wg.compute_values(batch)
+                            values = self._compute_values(batch)
                             batch = batch.union(values)
 
-                    # Compute rollout IS weights and mismatch metrics (inherited from RayPPOTrainer)
-                    batch, is_metrics = self.compute_rollout_importance_weights_and_add_to_batch(batch)
-                    # IS and mismatch metrics already have mismatch/ prefix
-                    metrics.update(is_metrics)
+                    # Compute rollout correction weights and off-policy metrics (inherited from RayPPOTrainer)
+                    from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                    if rollout_corr_config is not None and "rollout_log_probs" in batch.batch:
+                        batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+                        # IS and off-policy metrics already have rollout_corr/ prefix
+                        metrics.update(is_metrics)
 
                     with marked_timer("adv", timing_raw, "brown"):
                         # compute advantages, executed on the driver process
@@ -349,13 +340,13 @@ class RayDAPOTrainer(RayPPOTrainer):
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config,
+                            config=self.config.algorithm,
                         )
 
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, "pink"):
-                            critic_output = self.critic_wg.update_critic(batch)
+                            critic_output = self._update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
@@ -363,7 +354,25 @@ class RayDAPOTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, "red"):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output = self._update_actor(batch)
+
+                        # Check if ESI/training plan is close to expiration
+                        esi_close_to_expiration = should_save_ckpt_esi(
+                            max_steps_duration=self.max_steps_duration,
+                            redundant_time=self.config.trainer.esi_redundant_time,
+                        )
+                        if self.config.trainer.save_freq > 0 and (
+                            is_last_step
+                            or self.global_steps % self.config.trainer.save_freq == 0
+                            or esi_close_to_expiration
+                        ):
+                            if esi_close_to_expiration:
+                                print("Force saving checkpoint: ESI instance expiration approaching.")
+                            with marked_timer("save_checkpoint", timing_raw, "green"):
+                                self._save_checkpoint()
+
+                        with marked_timer("update_weights", timing_raw, "red"):
+                            self.checkpoint_manager.update_weights()
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -373,22 +382,14 @@ class RayDAPOTrainer(RayPPOTrainer):
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
-                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                if self.config.trainer.test_freq > 0 and (
+                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
                     with marked_timer("testing", timing_raw, "green"):
                         val_metrics: dict = self._validate()
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
-
-                if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
-                ):
-                    with marked_timer("save_checkpoint", timing_raw, "green"):
-                        self._save_checkpoint()
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
@@ -403,6 +404,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                     )
                     prev_step_profile = curr_step_profile
                     curr_step_profile = next_step_profile
+
+                steps_duration = timing_raw.get("step", 0)
+                self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
@@ -421,6 +425,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                 logger.log(data=metrics, step=self.global_steps)
 
                 if is_last_step:
+                    if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
+                        self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -428,15 +434,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                 progress_bar.update(1)
                 self.global_steps += 1
                 self.gen_steps += 1
-            # 每个 epoch 结束后，基于当前 knn_state 聚类并可视化一次
-            # save_epoch_knn_visualizations(
-            #     config=self.config,
-            #     epoch_idx=epoch,
-            #     knn_state=self.knn_state,
-            #     knn_prompt_examples=self.knn_prompt_examples,
-            # )
-
-
         # check if last step checkpint exists
         checkpoint_dir = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
         if not os.path.exists(checkpoint_dir):
@@ -446,5 +443,3 @@ class RayDAPOTrainer(RayPPOTrainer):
                 self._save_checkpoint()
             metrics = {f"timing/{k}": v for k, v in timing_raw.items()}
             logger.log(data=metrics, step=self.global_steps)
-
-

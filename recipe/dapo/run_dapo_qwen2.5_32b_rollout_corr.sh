@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-project_name='DAPO-Qwen2.5-7B-Instruct'
-exp_name='DAPO-Qwen2.5-7B-Instruct'
+# Rollout Correction Example
+# References:
+#   - Rollout Correction Docs: https://github.com/volcengine/verl/blob/main/docs/algo/rollout_corr.md
+#   - Rollout Correction Math: https://github.com/volcengine/verl/blob/main/docs/algo/rollout_corr_math.md
+#   - When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch: https://richardli.xyz/rl-collapse
+#   - Off-policy RL: https://fengyao.notion.site/off-policy-rl
+
+project_name='DAPO'
+exp_name='DAPO-Qwen2.5-32B-RolloutCorr'  # Rollout Correction
 
 adv_estimator=grpo
 
@@ -10,34 +17,43 @@ use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
+
+# Rollout Correction parameters (sequence-level TIS + geometric RS)
+rollout_is=sequence
+rollout_is_threshold=2.0
+rollout_is_batch_normalize=true
+rollout_rs=geometric
+rollout_rs_threshold=1.01
+rollout_rs_threshold_lower=0.99
+rollout_token_veto_threshold=1e-4
+
 clip_ratio_low=0.2
 clip_ratio_high=0.28
+
 max_prompt_length=$((1024 * 2))
 max_response_length=$((1024 * 20))
 enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
+
 loss_agg_mode="token-mean"
+
 enable_filter_groups=True
 filter_groups_metric=acc
 max_num_gen_batches=10
-
-NNODES=1
-
-train_prompt_bsz=16
+train_prompt_bsz=512
 gen_prompt_bsz=$((train_prompt_bsz * 3))
 n_resp_per_prompt=16
-train_prompt_mini_bsz=1
+train_prompt_mini_bsz=32
 
 # Ray
-PWD=./
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
-
+NNODES=${NNODES:-16}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-7B-Instruct"}
+MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-32B"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
@@ -46,18 +62,39 @@ TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 temperature=1.0
 top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
+val_top_p=0.7
 
 # Performance Related Parameter
-sp_size=4
+sp_size=8
 use_dynamic_bsz=True
-actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
-infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
+actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
+infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 offload=True
-gen_tp=1
+gen_tp=4
+
+
+# Rollout Correction (corrects distribution mismatch between rollout and training)
+#
+# Configuration: DAPO with Rollout Correction:
+# - Self-normalized sequence-level TIS (Truncated Importance Sampling)
+# - Geometric rejection sampling for outlier filtering
+# - Token veto for catastrophic distribution shifts
+#
+# Please note that server mode (agent loop) hasn't returned rollout_log_probs for now,
+# so currently server mode is not supported for Rollout Correction.
+#
+# Rollout Correction parameters (configured at top of script):
+#   algorithm.rollout_correction.rollout_is=sequence
+#   algorithm.rollout_correction.rollout_is_threshold=2.0
+#   algorithm.rollout_correction.rollout_is_batch_normalize=true
+#   algorithm.rollout_correction.rollout_rs=geometric
+#   algorithm.rollout_correction.rollout_rs_threshold=1.01
+#   algorithm.rollout_correction.rollout_rs_threshold_lower=0.99
+#   algorithm.rollout_correction.rollout_token_veto_threshold=1e-4
+#   actor_rollout_ref.rollout.calculate_log_probs=True  # Required!
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
-    --address "${RAY_ADDRESS}" \
     -- python3 -m recipe.dapo.main_dapo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
@@ -79,8 +116,6 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.filter_groups.enable=${enable_filter_groups} \
     algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
-    actor_rollout_ref.actor.use_torch_compile=False \
-    actor_rollout_ref.ref.use_torch_compile=False \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
@@ -88,12 +123,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
-    actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
-    +actor_rollout_ref.model.override_config.attention_dropout=0. \
-    +actor_rollout_ref.model.override_config.embd_pdrop=0. \
-    +actor_rollout_ref.model.override_config.resid_pdrop=0. \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
@@ -105,7 +135,15 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.50 \
+    algorithm.rollout_correction.rollout_is=${rollout_is} \
+    algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
+    algorithm.rollout_correction.rollout_is_batch_normalize=${rollout_is_batch_normalize} \
+    algorithm.rollout_correction.rollout_rs=${rollout_rs} \
+    algorithm.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold} \
+    algorithm.rollout_correction.rollout_rs_threshold_lower=${rollout_rs_threshold_lower} \
+    algorithm.rollout_correction.rollout_token_veto_threshold=${rollout_token_veto_threshold} \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
@@ -113,33 +151,26 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.top_k="${top_k}" \
     actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
-    actor_rollout_ref.rollout.val_kwargs.top_p=${top_p} \
+    actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \
     reward_model.reward_manager=dapo \
-    +reward_model.overlong_buffer.enable=${enable_overlong_buffer} \
-    +reward_model.overlong_buffer.len=${overlong_buffer_len} \
-    +reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
-    +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
-    trainer.logger="['console']" \
+    reward_model.overlong_buffer.enable=${enable_overlong_buffer} \
+    reward_model.overlong_buffer.len=${overlong_buffer_len} \
+    reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
+    trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.n_gpus_per_node=16 \
+    trainer.n_gpus_per_node=8 \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=True \
     trainer.test_freq=5 \
-    trainer.save_freq=20 \
+    trainer.save_freq=5 \
     trainer.total_epochs=1 \
     trainer.default_local_dir="${CKPTS_DIR}" \
-    trainer.resume_mode=auto \
-    trainer.device=npu \
-    actor_rollout_ref.actor.entropy_checkpointing=True \
-    actor_rollout_ref.ref.entropy_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
-    actor_rollout_ref.ref.fsdp_config.forward_prefetch=True \
-    actor_rollout_ref.actor.entropy_from_logits_with_chunking=True \
-    actor_rollout_ref.ref.entropy_from_logits_with_chunking=True
+    trainer.resume_mode=auto 

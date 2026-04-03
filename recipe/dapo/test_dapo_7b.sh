@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-#!/usr/bin/env bash
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='DAPO-Qwen2.5-7B-Math-baseline-1024'
+exp_name='DAPO-Qwen2.5-7B-Math-Test'
 
 adv_estimator=grpo
 
@@ -15,8 +14,8 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 
-max_prompt_length=1024
-max_response_length=3072
+max_prompt_length=$((1024 * 2))
+max_response_length=$((1024 * 2))
 enable_overlong_buffer=True
 overlong_buffer_len=512
 overlong_penalty_factor=1.0
@@ -27,21 +26,21 @@ enable_filter_groups=True
 filter_groups_metric=acc
 max_num_gen_batches=10
 train_prompt_bsz=512
-gen_prompt_bsz=512
-train_prompt_mini_bsz=16
+gen_prompt_bsz=$((train_prompt_bsz * 3))
+train_prompt_mini_bsz=32
 n_resp_per_prompt=16
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
-NNODES=${NNODES:-1}
+NNODES=${NNODES:-4}
 # Paths
-RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/bwang/Reward_RL"}
-MODEL_PATH=${MODEL_PATH:-"${HOME}/models/Qwen2.5-Math-7B"}
-CKPTS_DIR=${CKPTS_DIR:-"${HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${HOME}/data/unified_math_dapo_mathformat.parquet"}
-TEST_FILE=${TEST_FILE:-"${HOME}/data/AIME_2024/aime-2024-math.parquet"}
+RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
+MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-Math-7B"}
+CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
+TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
+TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
 # Algorithm
 temperature=1.0
@@ -126,7 +125,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=True \
     trainer.test_freq=2 \
-    trainer.save_freq=200 \
-    trainer.total_epochs=100 \
+    trainer.save_freq=2 \
+    trainer.total_epochs=1 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=disable
