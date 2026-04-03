@@ -553,6 +553,10 @@ class DataParallelPPOActor(BasePPOActor):
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
+                    use_entropy_advantage = self.config.get("use_entropy_advantage", False)
+                    if use_entropy_advantage:
+                        advantages += torch.min(0.4 * entropy.detach(), advantages.abs()/2)
+                        
                     # Compute policy loss (all functions return 4 values)
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=old_log_prob,

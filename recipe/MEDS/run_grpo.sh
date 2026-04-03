@@ -18,8 +18,8 @@ CKPTS_DIR=${CKPTS_DIR:-"${HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${HOME}/data/unified_math.parquet"}
 TEST_FILE=${TEST_FILE:-"${HOME}/data/aime-2024.parquet"}
 
-ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-"${HOME}/${project_name}/rollout/${exp_name}"}
-VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-"${HOME}/${project_name}/val_rollout/${exp_name}"}
+ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-"${HOME}/rollout/${project_name}/${exp_name}"}
+VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-"${HOME}/val_rollout/${project_name}/${exp_name}"}
 
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
