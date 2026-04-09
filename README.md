@@ -6,16 +6,18 @@ To achieve this, MEDS reuses layer-wise logits from the forward pass as lightwei
 
 ## Contents
 
-- [Installation](#installation)
 - [Getting Started](#getting-started)
-- [Data Format](#data-format)
+  - [Environment Setup](#environment-setup)
+  - [Training with MEDS](#training-with-meds)
+- [Configuration](#configuration)
 - [Evaluation](#evaluation)
+- [Data Preparation](#data-preparation)
 - [Citation](#citation)
 - [License](#license)
 
+## Getting Started
+### Environment Setup
 
-## Installation
-Install the Python dependencies:
 ```bash
 # Clone the MEDS repository
 git clone https://github.com/Linxi000/MEDS.git
@@ -29,52 +31,71 @@ conda activate meds
 pip install -r requirements.txt
 ```
 
-MEDS is built on top of veRL. Please also install [veRL](https://github.com/volcengine/verl) and make sure your environment is compatible with the required CUDA version.
-
-## Getting Started
+MEDS is built on top of veRL. Please follow the [veRL installation guide](https://github.com/volcengine/verl) to set up the framework, then place the MEDS directory into your verl repo root to get started.
 
 ### Training with MEDS
 
+Set the required paths and launch training:
+
 ```bash
+export MODEL_PATH="${HOME}/models/Qwen2.5-Math-7B"  # Base model path
+export TRAIN_FILE="${HOME}/data/unified_math.parquet"
+export TEST_FILE="${HOME}/data/aime-2024.parquet"
+export CKPTS_DIR="${HOME}/ckpts/MEDS/meds_7b"
+
 bash recipe/MEDS/run_meds.sh
 ```
-You can modify key training options such as clustering method, penalty coefficient, and layer selection in `recipe/MEDS/run_meds.sh`.
 
-### Training with DAPO (Baseline)
-
-```bash
-bash recipe/MEDS/run_dapo.sh
-```
+This runs MEDS training with the default configuration (Qwen2.5-Math-7B, 8 GPUs per node, 100 epochs).
 
 ## Configuration
 
-Training is configured through the shell scripts in `recipe/MEDS/` and the Hydra YAML files under `recipe/MEDS/config/`. These files control data loading, rollout settings, PPO training, reward shaping, and checkpointing.
-The training configuration is managed via Hydra YAML files in `config/`.
+Key hyperparameters in `recipe/MEDS/run_meds.sh`:
 
-Key configuration options in `run_meds.sh`:
-- `cluster_method`: Clustering algorithm `hdbscan`
-- `penalty_coef`: Coefficient for diversity penalty
-- `use_layer_diff`: Whether to use layer difference for clustering
-- `use_last_n_layers`: Number of last layers to use for clustering
-- `cluster_penalty_target`: Target for penalty (`wrong`, `right`, `both`, `none`)
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `cluster_method` | `hdbscan` | Clustering algorithm for error pattern grouping |
+| `use_layer_diff` | `False` | Whether to use layer-difference features for clustering |
+| `use_last_n_layers` | `14` | Number of last transformer layers used for clustering |
+| `cluster_penalty_target` | `wrong` | Which responses to penalize: `wrong` / `right` / `both` / `none` |
+| `penalty_coef` | `0.1` | Strength of the diversity penalty |
 
-## Data Format
+Fine-grained Hydra config options are in `recipe/MEDS/config/meds_trainer.yaml`.
 
-MEDS uses the unified math data format. The `unified_math_data.py` script processes datasets into a standardized format:
-
-```python
-{
-    "prompt": str,              # Problem text
-    "solution": str,            # Full solution
-    "ground_truth": str,        # Ground truth answer
-    "data_source": str,         # Dataset source
-    "ability": str,             # Problem ability level
-}
-```
 ## Evaluation
 
-这里要说一下咋跑的
+Our evaluation pipeline fully follows the official open-source implementation from [LIMO](https://github.com/GAIR-NLP/LIMO), particularly its evaluation module.
 
+First, install the required dependencies under the `LIMO/eval` directory:
+
+```bash
+pip install -r requirements.txt
+```
+
+To launch the full evaluation pipeline, run:
+
+```bash
+bash eval.sh
+```
+
+To evaluate a specific checkpoint, update the `--model_name_or_path` argument in `eval.sh` to point to your target checkpoint directory.
+
+To change the number of GPUs or specify particular devices, modify `CUDA_VISIBLE_DEVICES` in the script. For example:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3
+```
+
+To evaluate pass@k, adjust the following parameters:
+
+- `n_sampling`: total number of samples generated per problem
+- `k`: the k value used for pass@k computation
+
+The maximum generation length used in our experiments is `max_tokens = 8192`.
+
+## Data Preparation
+
+The training set is a unified math dataset combining [DAPO-Math-17K](https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17K) and difficulty levels 3–5 of [MATH-lighteval](https://huggingface.co/datasets/DigitalLearningGmbH/MATH-lighteval), with deduplication applied. The validation set is [AIME 2024](https://huggingface.co/datasets/HuggingFaceH4/aime_2024).
 
 ## Citation
 
@@ -86,10 +107,9 @@ Our paper is available on [Arxiv](). If you find our code useful, please conside
 
 ## License
 
-This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
+This project is licensed under the [Apache-2.0 License](LICENSE).
 
 ## Acknowledgments
 
 - Built on top of the [veRL](https://github.com/volcengine/verl) framework
-- Inspired by [DAPO](https://github.com/BytedTS/DAPO) and other RL training recipes
 - Uses [HDBSCAN](https://github.com/scikit-learn-contrib/hdbscan) for clustering
