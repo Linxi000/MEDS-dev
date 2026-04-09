@@ -111,5 +111,4 @@ This project is licensed under the [Apache-2.0 License](LICENSE).
 
 ## Acknowledgments
 
-- Built on top of the [veRL](https://github.com/volcengine/verl) framework
-- Uses [HDBSCAN](https://github.com/scikit-learn-contrib/hdbscan) for clustering
+We gratefully acknowledge the open-source projects that made this work possible. This project is built on top of the [veRL](https://github.com/volcengine/verl) framework, uses [HDBSCAN](https://github.com/scikit-learn-contrib/hdbscan) for clustering, and is trained based on [Qwen2.5](https://qwenlm.github.io/blog/qwen2.5/) and [Qwen3](https://qwenlm.github.io/blog/qwen3/). We sincerely thank the contributors and maintainers of these projects for their valuable contributions to the open-source community.
