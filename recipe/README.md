@@ -6,7 +6,7 @@ This directory contains the implementation of **MEDS** (Memory-Enhanced Diversit
 
 ```
 recipe/
-└── MEDS/         
+└── meds/         
     ├── config/      
     ├── main_meds.py   
     ├── meds_ray_trainer.py     

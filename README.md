@@ -43,14 +43,14 @@ export TRAIN_FILE="${HOME}/data/unified_math.parquet"
 export TEST_FILE="${HOME}/data/aime-2024.parquet"
 export CKPTS_DIR="${HOME}/ckpts/MEDS/meds_7b"
 
-bash recipe/MEDS/run_meds.sh
+bash recipe/meds/run_meds.sh
 ```
 
 This runs MEDS training with the default configuration (Qwen2.5-Math-7B, 8 GPUs per node, 100 epochs).
 
 ## Configuration
 
-Key hyperparameters in `recipe/MEDS/run_meds.sh`:
+Key hyperparameters in `recipe/meds/run_meds.sh`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -60,7 +60,7 @@ Key hyperparameters in `recipe/MEDS/run_meds.sh`:
 | `cluster_penalty_target` | `wrong` | Which responses to penalize: `wrong` / `right` / `both` / `none` |
 | `penalty_coef` | `0.1` | Strength of the diversity penalty |
 
-Fine-grained Hydra config options are in `recipe/MEDS/config/meds_trainer.yaml`.
+Fine-grained Hydra config options are in `recipe/meds/config/meds_trainer.yaml`.
 
 ## Evaluation
 
